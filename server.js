@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import { readFileSync } from 'fs';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { getHistory, addMessage } from './memory.js';
 
 const {
@@ -9,48 +8,108 @@ const {
   PHONE_NUMBER_ID,
   VERIFY_TOKEN,
   OWNER_NUMBER,
-  GEMINI_API_KEY,
   PORT = 3000,
 } = process.env;
 
 const GRAPH = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
 const knowledge = readFileSync('./knowledge.md', 'utf-8');
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+// --- LLM providers, tried in order until one succeeds --------------------
+// Add as many Gemini keys as you like via env vars. Each key has its own
+// daily free quota, so N keys ~= N x capacity. OpenRouter is the final net.
+//   GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3, GEMINI_API_KEY_4
+//   OPENROUTER_API_KEY   (get free key at openrouter.ai)
+const GEMINI_KEYS = [
+  process.env.GEMINI_API_KEY,
+  process.env.GEMINI_API_KEY_2,
+  process.env.GEMINI_API_KEY_3,
+  process.env.GEMINI_API_KEY_4,
+].filter(Boolean);
 
-// Free-tier models each have their own small daily quota. We try them in order:
-// when one is rate-limited (429) or overloaded (503), fall through to the next.
-// This multiplies total daily capacity and avoids one limit killing the bot.
-const MODELS = [
-  'gemini-2.5-flash-lite',
-  'gemini-2.0-flash-lite',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
+// Models tried per Gemini key (cheapest/fastest first).
+const GEMINI_MODELS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+
+// OpenRouter free models — final fallback if all Gemini quotas are spent.
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODELS = [
+  'qwen/qwen3-next-80b-a3b-instruct:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+  'google/gemma-4-31b-it:free',
 ];
 
-// Try each model; on 429/503 move to the next. One short retry per model for 503.
+// One Gemini call via REST (so we can rotate raw keys easily).
+async function callGemini(key, modelName, prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${key}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+  });
+  if (!res.ok) {
+    const e = new Error(`Gemini ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw Object.assign(new Error('Gemini empty'), { status: 500 });
+  return text.trim();
+}
+
+// One OpenRouter call (OpenAI-compatible chat API).
+async function callOpenRouter(modelName, prompt) {
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: modelName,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+  if (!res.ok) {
+    const e = new Error(`OpenRouter ${res.status}`);
+    e.status = res.status;
+    throw e;
+  }
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw Object.assign(new Error('OpenRouter empty'), { status: 500 });
+  return text.trim();
+}
+
+// Try Gemini keys x models, then OpenRouter models. Skip any that 429/503.
 async function generateWithRetry(prompt) {
   let lastErr;
-  for (const name of MODELS) {
-    const model = genAI.getGenerativeModel({ model: name });
-    for (let attempt = 0; attempt < 2; attempt++) {
+
+  // 1) Every Gemini key, every model.
+  for (let k = 0; k < GEMINI_KEYS.length; k++) {
+    for (const modelName of GEMINI_MODELS) {
       try {
-        const result = await model.generateContent(prompt);
-        return result.response.text().trim();
+        return await callGemini(GEMINI_KEYS[k], modelName, prompt);
       } catch (err) {
         lastErr = err;
-        const status = err?.status;
-        if (status === 503 && attempt === 0) {
-          await new Promise(r => setTimeout(r, 1200)); // brief pause, retry same model
-          continue;
-        }
-        // 429 (daily quota) or repeated 503 -> break to next model
-        console.log(`Model ${name} failed (${status}), trying next...`);
-        break;
+        console.log(`Gemini key#${k + 1} ${modelName} failed (${err.status}), next...`);
+        // 429 = quota for this key/model; 503 = overloaded. Either way move on.
       }
     }
   }
-  throw lastErr;
+
+  // 2) OpenRouter fallback.
+  if (OPENROUTER_KEY) {
+    for (const modelName of OPENROUTER_MODELS) {
+      try {
+        return await callOpenRouter(modelName, prompt);
+      } catch (err) {
+        lastErr = err;
+        console.log(`OpenRouter ${modelName} failed (${err.status}), next...`);
+      }
+    }
+  }
+
+  throw lastErr || new Error('No LLM provider available');
 }
 
 const systemPrompt = `You are the assistant replying on behalf of Aditya Singh of
