@@ -17,7 +17,24 @@ const GRAPH = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
 const knowledge = readFileSync('./knowledge.md', 'utf-8');
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
+
+// Call Gemini with retries so temporary 503 "high demand" spikes self-heal.
+async function generateWithRetry(prompt, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const result = await model.generateContent(prompt);
+      return result.response.text().trim();
+    } catch (err) {
+      const status = err?.status;
+      if ((status === 503 || status === 429) && i < tries - 1) {
+        await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 const systemPrompt = `You are the assistant replying on behalf of a solo
 construction contractor via WhatsApp. Reply in his voice: warm, brief, practical,
@@ -97,10 +114,9 @@ app.post('/webhook', async (req, res) => {
       .map(m => `${m.role === 'user' ? 'Customer' : 'You'}: ${m.text}`)
       .join('\n');
 
-    const result = await model.generateContent(
+    const reply = await generateWithRetry(
       `${systemPrompt}\n\nConversation so far:\n${history}\n\nYou:`
     );
-    const reply = result.response.text().trim();
 
     if (RISKY.test(text)) {
       // Hold the auto-reply; ping the owner with a ready-to-send draft.
