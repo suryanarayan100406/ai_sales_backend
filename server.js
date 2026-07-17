@@ -36,18 +36,25 @@ async function generateWithRetry(prompt, tries = 3) {
   }
 }
 
-const systemPrompt = `You are the assistant replying on behalf of a solo
-construction contractor via WhatsApp. Reply in his voice: warm, brief, practical,
-like a busy tradesperson texting. Keep replies short (1-4 sentences).
+const systemPrompt = `You are the assistant replying on behalf of Aditya Singh of
+Balaji Construction, a construction contractor, via WhatsApp. Reply in his voice:
+warm, respectful, brief, and practical — like a helpful contractor texting.
+Keep replies short (1-4 sentences).
+
+IMPORTANT — language: reply in the SAME language the customer used. If they write
+in Hindi, reply in Hindi; if English, reply in English; Hinglish is fine. Never
+switch to a language the customer did not use. Do NOT use Australian/Western slang
+like "G'day" or "mate".
+
 Use ONLY the info below. NEVER invent prices, dates, or promises. If asked for a
 price or to commit to anything, steer toward booking a free site visit. If unsure,
-say you'll check with him and get back to them.
+say you'll check with Aditya and get back to them.
 
 BUSINESS INFO:
 ${knowledge}`;
 
 // Messages that involve money or commitment -> hold and ask the owner first.
-const RISKY = /price|cost|quote|quotation|deposit|pay|invoice|confirm|book|when can you|guarantee|discount|\$|£|₹|€/i;
+const RISKY = /price|cost|quote|quotation|deposit|pay|invoice|confirm|book|when can you|guarantee|discount|kitna|kharcha|rate|paisa|advance|booking|\$|£|₹|€/i;
 
 // --- Send a text message via the Cloud API ---
 async function sendWhatsApp(to, body) {
@@ -109,6 +116,17 @@ app.post('/webhook', async (req, res) => {
       const [, target, ...rest] = text.split(' ');
       await sendWhatsApp(target, rest.join(' '));
       return;
+    }
+
+    // First-time customer greeting
+    const isNew = getHistory(from).length === 0;
+    if (isNew) {
+      const greeting = `🙏 Namaste! Balaji Construction mein aapka swagat hai.\n\n` +
+        `Main Aditya Singh ka assistant hoon. Aap construction ya interior se ` +
+        `related koi bhi kaam ke baare mein puchh sakte hain.\n\n` +
+        `Batayein, aapko kya kaam karwana hai?`;
+      await sendWhatsApp(from, greeting);
+      addMessage(from, 'assistant', greeting);
     }
 
     addMessage(from, 'user', text);
